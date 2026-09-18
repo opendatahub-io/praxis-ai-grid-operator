@@ -25,28 +25,20 @@
 //!
 //! [`rustls::ClientConfig`]: rustls::ClientConfig
 
-use std::{sync::Arc, time::Duration};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+
+use crate::resources::tls_backend::ClientTlsConfig;
+pub(crate) use crate::resources::tls_backend::{
+    build_custom_tls_connector, build_native_connector, build_pinned_client_config, build_tls_client_config,
+};
 
 // ---------------------------------------------------------------------------
 // Bounded input limits
 // ---------------------------------------------------------------------------
-
-/// Maximum size for a CA PEM bundle (256 KiB).
-const MAX_CA_PEM_BYTES: usize = 256 * 1024;
-
-/// Maximum size for a client certificate PEM (64 KiB).
-const MAX_CLIENT_CERT_PEM_BYTES: usize = 64 * 1024;
-
-/// Maximum size for a client private key PEM (64 KiB).
-const MAX_CLIENT_KEY_PEM_BYTES: usize = 64 * 1024;
-
-/// Maximum number of certificates in a CA or client chain.
-const MAX_CERT_CHAIN_LENGTH: usize = 10;
 
 /// Maximum size for a metrics response body (1 MiB).
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
@@ -55,7 +47,7 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Error returned by [`scrape_metrics`].
+/// Error returned by `scrape_metrics`.
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsScrapeError {
     /// The URL could not be parsed.
@@ -112,15 +104,30 @@ pub enum MetricsScrapeError {
 /// Returns [`MetricsScrapeError::Timeout`] if the request exceeds `timeout`.
 /// Returns [`MetricsScrapeError::NonOkStatus`] for non-2xx responses.
 /// Returns [`MetricsScrapeError::Transport`] for connection failures.
+pub(crate) async fn scrape_metrics(
+    url: &str,
+    timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<String, MetricsScrapeError> {
+    scrape_metrics_with_date(url, timeout, tls_config)
+        .await
+        .map(|(body, _)| body)
+}
+
+/// Like [`scrape_metrics`], but also returns the response `Date` header parsed
+/// to a [`SystemTime`], or `None` when it is absent or unparseable.
+///
+/// The peer poller uses the date to re-express a relayed sample's age on one
+/// clock.
 #[expect(
     clippy::too_many_lines,
     reason = "URL parse + scheme check + client build + request + body read: sequential steps"
 )]
-pub async fn scrape_metrics(
+pub(crate) async fn scrape_metrics_with_date(
     url: &str,
     timeout: Duration,
-    tls_config: Option<Arc<rustls::ClientConfig>>,
-) -> Result<String, MetricsScrapeError> {
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
     let uri = url
         .parse::<http::Uri>()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
@@ -137,7 +144,7 @@ pub async fn scrape_metrics(
     }
 
     let connector = if let Some(config) = &tls_config {
-        build_custom_tls_connector(config)
+        build_custom_tls_connector(config)?
     } else {
         build_native_connector()?
     };
@@ -162,6 +169,12 @@ pub async fn scrape_metrics(
         });
     }
 
+    let date = response
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| httpdate::parse_http_date(text).ok());
+
     let body_bytes = Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES)
         .collect()
         .await
@@ -176,135 +189,10 @@ pub async fn scrape_metrics(
         })?
         .to_bytes();
 
-    String::from_utf8(body_bytes.to_vec()).map_err(MetricsScrapeError::Encoding)
+    let body = String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)?;
+    Ok((body, date))
 }
 
-// ---------------------------------------------------------------------------
-// TLS client config builder
-// ---------------------------------------------------------------------------
-
-/// Build a [`rustls::ClientConfig`] from raw PEM bytes.
-///
-/// `ca_pem` is the CA certificate chain (required).  `client_cert_pem` and
-/// `client_key_pem` are the client identity for mTLS (both required together,
-/// or both absent for one-way TLS).
-///
-/// # Security invariant
-///
-/// Private key bytes are consumed by `rustls` and never written to logs,
-/// events, status fields, or Prometheus labels.
-///
-/// # Errors
-///
-/// Returns [`MetricsScrapeError::TlsMaterial`] when PEM parsing fails or the
-/// material is structurally invalid.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential PEM parsing for CA, client cert, and client key with validation"
-)]
-pub fn build_tls_client_config(
-    ca_pem: &[u8],
-    client_cert_pem: Option<&[u8]>,
-    client_key_pem: Option<&[u8]>,
-) -> Result<rustls::ClientConfig, MetricsScrapeError> {
-    if ca_pem.len() > MAX_CA_PEM_BYTES {
-        return Err(MetricsScrapeError::TlsMaterial(format!(
-            "CA PEM exceeds maximum size ({} bytes > {MAX_CA_PEM_BYTES})",
-            ca_pem.len()
-        )));
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs = CertificateDer::pem_slice_iter(ca_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA PEM parse failed: {e}")))?;
-    if ca_certs.is_empty() {
-        return Err(MetricsScrapeError::TlsMaterial(
-            "CA PEM contains no certificates".to_owned(),
-        ));
-    }
-    if ca_certs.len() > MAX_CERT_CHAIN_LENGTH {
-        return Err(MetricsScrapeError::TlsMaterial(format!(
-            "CA PEM contains too many certificates ({} > {MAX_CERT_CHAIN_LENGTH})",
-            ca_certs.len()
-        )));
-    }
-    for cert in &ca_certs {
-        root_store
-            .add(cert.clone())
-            .map_err(|e| MetricsScrapeError::TlsMaterial(format!("CA certificate invalid: {e}")))?;
-    }
-
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-
-    let config = match (client_cert_pem, client_key_pem) {
-        (Some(cert_pem), Some(key_pem)) => {
-            if cert_pem.len() > MAX_CLIENT_CERT_PEM_BYTES {
-                return Err(MetricsScrapeError::TlsMaterial(format!(
-                    "client cert PEM exceeds maximum size ({} bytes > {MAX_CLIENT_CERT_PEM_BYTES})",
-                    cert_pem.len()
-                )));
-            }
-            if key_pem.len() > MAX_CLIENT_KEY_PEM_BYTES {
-                return Err(MetricsScrapeError::TlsMaterial(format!(
-                    "client key PEM exceeds maximum size ({} bytes > {MAX_CLIENT_KEY_PEM_BYTES})",
-                    key_pem.len()
-                )));
-            }
-            let certs = CertificateDer::pem_slice_iter(cert_pem)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client cert PEM parse failed: {e}")))?;
-            if certs.is_empty() {
-                return Err(MetricsScrapeError::TlsMaterial(
-                    "client cert PEM contains no certificates".to_owned(),
-                ));
-            }
-            if certs.len() > MAX_CERT_CHAIN_LENGTH {
-                return Err(MetricsScrapeError::TlsMaterial(format!(
-                    "client cert PEM contains too many certificates ({} > {MAX_CERT_CHAIN_LENGTH})",
-                    certs.len()
-                )));
-            }
-            let key = PrivateKeyDer::from_pem_slice(key_pem)
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client key PEM parse failed: {e}")))?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| MetricsScrapeError::TlsMaterial(format!("client identity construction failed: {e}")))?
-        },
-        (None, None) => builder.with_no_client_auth(),
-        _ => {
-            return Err(MetricsScrapeError::TlsMaterial(
-                "client cert and key must both be present or both absent".to_owned(),
-            ));
-        },
-    };
-
-    Ok(config)
-}
-
-// ---------------------------------------------------------------------------
-// Connector builders
-// ---------------------------------------------------------------------------
-
-/// Build an HTTPS connector using native root certificates.
-fn build_native_connector()
--> Result<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, MetricsScrapeError> {
-    hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .map(|b| b.https_or_http().enable_http1().build())
-        .map_err(|e| MetricsScrapeError::Transport(e.into()))
-}
-
-/// Build an HTTPS-only connector using a custom [`rustls::ClientConfig`].
-pub(crate) fn build_custom_tls_connector(
-    config: &rustls::ClientConfig,
-) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
-    hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(config.clone())
-        .https_only()
-        .enable_http1()
-        .build()
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -314,9 +202,14 @@ pub(crate) fn build_custom_tls_connector(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::sync::Arc;
+
+    #[cfg(not(feature = "fips"))]
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+    use crate::resources::tls_backend::{MAX_CA_PEM_BYTES, MAX_CLIENT_CERT_PEM_BYTES, MAX_CLIENT_KEY_PEM_BYTES};
 
     /// Start a local HTTP server on a random port and return the URL.
     async fn start_test_server(response: &'static [u8]) -> String {
@@ -564,6 +457,7 @@ mod tests {
     ///
     /// `client_ca_pem`: when `Some`, the server requires client certificate
     /// authentication (mTLS).  When `None`, one-way TLS only.
+    #[cfg(not(feature = "fips"))]
     #[expect(
         clippy::too_many_lines,
         reason = "TLS server setup: certs + verifier + acceptor + one-shot handler"
@@ -610,6 +504,62 @@ mod tests {
                 && let Ok(tls_stream) = acceptor.accept(stream).await
             {
                 let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                let mut buf = [0_u8; 4096];
+                drop(reader.read(&mut buf).await);
+                drop(writer.write_all(&response).await);
+            }
+        });
+
+        format!("https://localhost:{port}")
+    }
+
+    /// OpenSSL twin of the rustls one-shot TLS server, so the scrape and mTLS
+    /// integration tests exercise the real `hyper-openssl` connector path
+    /// under `fips`.
+    #[cfg(feature = "fips")]
+    #[expect(clippy::too_many_lines, reason = "OpenSSL test server setup")]
+    async fn start_tls_test_server(
+        server_cert_pem: &str,
+        server_key_pem: &str,
+        client_ca_pem: Option<&str>,
+        response: Vec<u8>,
+    ) -> String {
+        use openssl::{
+            pkey::PKey,
+            ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode},
+            x509::{X509, store::X509StoreBuilder},
+        };
+
+        let cert = X509::from_pem(server_cert_pem.as_bytes()).unwrap();
+        let key = PKey::private_key_from_pem(server_key_pem.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.check_private_key().unwrap();
+        if let Some(ca) = client_ca_pem {
+            let mut store = X509StoreBuilder::new().unwrap();
+            for client_ca in X509::stack_from_pem(ca.as_bytes()).unwrap() {
+                store.add_cert(client_ca).unwrap();
+            }
+            builder.set_verify_cert_store(store.build()).unwrap();
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        let acceptor = builder.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ssl) = Ssl::new(acceptor.context()) else {
+                return;
+            };
+            let Ok(mut tls) = tokio_openssl::SslStream::new(ssl, stream) else {
+                return;
+            };
+            if std::pin::Pin::new(&mut tls).accept().await.is_ok() {
+                let (mut reader, mut writer) = tokio::io::split(tls);
                 let mut buf = [0_u8; 4096];
                 drop(reader.read(&mut buf).await);
                 drop(writer.write_all(&response).await);
@@ -718,6 +668,123 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
             "error must be Transport (server rejected missing client cert)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pinned peer polling
+    // -----------------------------------------------------------------------
+
+    /// The SHA-256 fingerprint of a certificate's leaf, as a pin string.
+    fn leaf_pin(cert_pem: &str) -> String {
+        let der = crate::resources::tls_backend::first_cert_der_from_pem(cert_pem).unwrap();
+        crate::signals::leaf_fingerprint(&der)
+    }
+
+    #[tokio::test]
+    async fn pinned_scrape_accepts_the_declared_leaf_despite_a_name_mismatch() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        // SAN is peer.local, but a peer is dialled by IP, so the name never
+        // matches. The pin is what accepts it.
+        let server_cert = certs::generate_dns_cert(&ca, "peer", "peer.local").unwrap();
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 16\r\n\r\ntest_metric 3.0\n".to_vec(),
+        )
+        .await;
+
+        let pin = leaf_pin(&server_cert.cert_pem);
+        let config = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[pin]).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+        assert!(result.is_ok(), "a matching pin must accept the peer: {result:?}");
+        assert!(result.unwrap().contains("test_metric"), "body must be returned");
+    }
+
+    #[tokio::test]
+    async fn pinned_scrape_rejects_an_undeclared_leaf() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "peer", "localhost").unwrap();
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        // A cert signed by the same CA but never declared: trust alone is not
+        // enough, the leaf must be the one this site wrote down.
+        let other = certs::generate_dns_cert(&ca, "other", "localhost").unwrap();
+        let config =
+            build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[leaf_pin(&other.cert_pem)]).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config)).await;
+        assert!(result.is_err(), "an undeclared leaf must be rejected");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (pin mismatch at handshake)"
+        );
+    }
+
+    #[test]
+    fn pinned_config_without_declared_pins_is_refused() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let result = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[]);
+        assert!(
+            matches!(result, Err(MetricsScrapeError::TlsMaterial(_))),
+            "dialling a peer with no declared pin must be refused"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-side seam (signals listener)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "server + client handshake round-trip setup")]
+    async fn server_accept_verifies_the_client_and_exposes_its_leaf() {
+        use crate::resources::tls_backend::{
+            accept, build_server_config, connect, parse_server_name, server_peer_leaf_der,
+        };
+
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "server", "localhost").unwrap();
+        let client_cert = certs::generate_dns_cert(&ca, "client", "client.local").unwrap();
+
+        let server_tls = build_server_config(
+            ca.cert_pem.as_bytes(),
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_leaf = crate::resources::tls_backend::first_cert_der_from_pem(&client_cert.cert_pem).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = accept(tcp, &server_tls).await.unwrap();
+            server_peer_leaf_der(&stream)
+        });
+
+        let client_tls = Arc::new(
+            build_tls_client_config(
+                ca.cert_pem.as_bytes(),
+                Some(client_cert.cert_pem.as_bytes()),
+                Some(client_cert.key_pem.as_bytes()),
+            )
+            .unwrap(),
+        );
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = parse_server_name("localhost").unwrap();
+        let _client = connect(tcp, &client_tls, &name).await.unwrap();
+
+        let presented = server.await.unwrap();
+        assert_eq!(
+            presented.as_deref(),
+            Some(client_leaf.as_slice()),
+            "the listener must expose the client's leaf certificate for scope"
         );
     }
 
@@ -861,7 +928,7 @@ mod tests {
         let ca = certs::generate_ca("test-ca").unwrap();
         let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
 
-        let cases: Vec<(&str, Result<rustls::ClientConfig, MetricsScrapeError>)> = vec![
+        let cases = vec![
             ("empty CA", build_tls_client_config(b"", None, None)),
             ("garbage CA", build_tls_client_config(b"not valid", None, None)),
             ("mismatched cert/key", {

@@ -15,10 +15,11 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit lint lint-extra fmt doc audit \
+	generate-api-types codegen-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
-	images container operator-image \
+	images container operator-image gateway-image \
 	mock-providers-image overlay-sync-image glb-demo-images \
 	kind-up kind-down \
 	dev-env dev-push dev-integration \
@@ -72,6 +73,18 @@ fmt:
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
+# -------------------------------------------------------------------
+# Codegen
+# -------------------------------------------------------------------
+
+# Regenerate the enrollment wire types from api/enrollment-v1alpha1.yaml.
+generate-api-types:
+	cargo run --quiet -p xtask -- generate-api-types
+
+# Fail if the checked-in wire types no longer match the spec.
+codegen-check:
+	cargo run --quiet -p xtask -- check-api-types
+
 audit:
 	cargo audit
 	cargo deny check
@@ -121,6 +134,9 @@ images: | require-container-engine
 
 operator-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f deploy/operator/Containerfile -t grid-operator:latest .
+
+gateway-image: | require-container-engine
+	$(CONTAINER_ENGINE) build -f deploy/gateway/Containerfile -t grid-gateway:latest .
 
 mock-providers-image: | require-container-engine
 	$(CONTAINER_ENGINE) build -f mock-providers/Containerfile -t grid-mock-providers:latest .
@@ -223,6 +239,7 @@ help:
 	@echo "  container            build container image"
 	@echo "  images               build container image"
 	@echo "  operator-image       build operator container image"
+	@echo "  gateway-image        build gateway container image"
 	@echo "  mock-providers-image build mock-providers container image"
 	@echo "  overlay-sync-image   build overlay-sync sidecar image"
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"
