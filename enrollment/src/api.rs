@@ -238,13 +238,11 @@ impl IntoResponse for ApiError {
 fn signing_error(err: EnrollError) -> ApiError {
     match err {
         EnrollError::Signing(detail) => ApiError::Internal(detail),
-        EnrollError::TooLarge
-        | EnrollError::Malformed
-        | EnrollError::BadSignature
-        | EnrollError::UnsupportedExtension
-        | EnrollError::InvalidSiteName => ApiError::BadRequest {
-            code: "invalid_csr",
-            message: err.to_string(),
+        EnrollError::TooLarge | EnrollError::Malformed | EnrollError::BadSignature | EnrollError::InvalidSiteName => {
+            ApiError::BadRequest {
+                code: "invalid_csr",
+                message: err.to_string(),
+            }
         },
     }
 }
@@ -384,19 +382,17 @@ async fn enroll(
 
     let csr = input.csr;
     let validity = Validity::starting_now(state.cert_lifetime);
-    let (enrollment_id, issued) = state
-        .store
-        .redeem_and_issue(&token_sha256, |pin: &Pin| {
-            // Signed under the pinned name, with every SAN rebuilt from it.
-            sign_csr(&state.ca, &pin.site_name, &csr, validity)
-                .map(|cert| Issued {
-                    certificate: cert.cert_pem,
-                    spiffe_id: cert.spiffe_id,
-                    public_key_sha256: cert.public_key_sha256,
-                })
-                .map_err(|err| StoreError::Backend(format!("signing failed: {err}")))
-        })
-        .await?;
+    let (enrollment_id, issued) = Box::pin(state.store.redeem_and_issue(&token_sha256, |pin: &Pin| {
+        // Signed under the pinned name, with every SAN rebuilt from it.
+        sign_csr(&state.ca, &pin.site_name, &csr, validity)
+            .map(|cert| Issued {
+                certificate: cert.cert_pem,
+                spiffe_id: cert.spiffe_id,
+                public_key_sha256: cert.public_key_sha256,
+            })
+            .map_err(|err| StoreError::Backend(format!("signing failed: {err}")))
+    }))
+    .await?;
 
     tracing::info!(%enrollment_id, spiffe_id = %issued.spiffe_id, "site enrolled");
     Ok((
@@ -442,13 +438,26 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// A fresh one-time site token: 256 bits from the system CSPRNG, hex encoded.
 ///
-/// ring's `SystemRandom`, the same source the gossip signing path uses, and never
-/// `SmallRng`. Hex keeps it header-safe with no padding.
+/// The default build draws from ring's `SystemRandom`. A fips build draws from
+/// system openssl so the entropy source stays in the validated module. Hex keeps
+/// it header-safe with no padding.
 fn generate_token() -> Result<String, ApiError> {
-    use ring::rand::SecureRandom as _;
     let mut bytes = [0_u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_unspecified| ApiError::Internal("system random source unavailable".to_owned()))?;
+    fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Fill a buffer from ring's system CSPRNG.
+#[cfg(not(feature = "fips"))]
+fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
+    use ring::rand::SecureRandom as _;
+    ring::rand::SystemRandom::new()
+        .fill(bytes)
+        .map_err(|_unspecified| ApiError::Internal("system random source unavailable".to_owned()))
+}
+
+/// Fill a buffer from system openssl, keeping the entropy source in the module.
+#[cfg(feature = "fips")]
+fn fill_random(bytes: &mut [u8]) -> Result<(), ApiError> {
+    openssl::rand::rand_bytes(bytes).map_err(|_err| ApiError::Internal("system random source unavailable".to_owned()))
 }
