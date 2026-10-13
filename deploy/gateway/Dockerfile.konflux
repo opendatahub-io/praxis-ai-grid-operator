@@ -3,12 +3,8 @@
 # @sha256 inline, which is the only form renovate's dockerfile manager tracks.
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:866c52a4f649b2e027e0eafeede5f37dd13ac58ab63bbe2950d7928334312a4c AS build
 
-# openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL. rust/cargo come as RPMs
-# because rustup cannot be prefetched under hermetic mode. The prefetched repo exists
-# only there, so a build without it uses the system repos.
-RUN REPOS=/cachi2/output/deps/rpm/$(uname -m)/repos.d; \
-    [ -d "$REPOS" ] && SETOPT="--setopt=reposdir=$REPOS" || SETOPT=""; \
-    dnf install -y --nodocs --setopt=install_weak_deps=0 $SETOPT \
+# openssl-devel/pkgconf: Pingora links OpenSSL. Build deps via the cachi2 RPM prefetch.
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         gcc gcc-c++ make cmake openssl-devel pkgconf-pkg-config rust cargo \
     && dnf clean all
 
