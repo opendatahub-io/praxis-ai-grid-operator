@@ -40,6 +40,15 @@ signal TTL when unset), or when it is `Unavailable`. The EPP counts endpoints
 with fresh metrics, so a saturated engine can read zero while serving, which is
 why two scrapes and the engine answer both gate the verdict.
 
+Provider scrapes run concurrently with a bound of 16. A network's readiness
+floor is one scrape interval plus the longer of one interval or the latest
+measured pass, and it overrides `staleMetricsSeconds` when longer. This keeps a
+successful sample valid until the next non-overlapping pass can refresh it. The
+trade-off is that a slow pass widens the window for every provider on the
+network, so a real failure is reported later. The 15s local-exclusion claim
+below therefore holds only when a pass finishes within one interval; scrape
+cadence follows the slowest provider's timeout, which has no upper bound.
+
 A scrape answering without the pool's ready-endpoint series leaves readiness
 unknown, not false, and does not exclude: a provider pointed at vLLM's own
 `/metrics` carries no such series.
@@ -147,3 +156,38 @@ says 1, and if every candidate is excluded the model answers 503.
 Loss of signal degrades to least preferred, not to idle. A drained burst stays
 penalized until it ages out rather than snapping back on the first missing
 sample.
+
+## Gateway rejection reports
+
+After each committed successful ingest and routing refresh, the gateway reports
+its `grid_signals_ingest_dropped_total{reason="skew"}` evidence to its local
+operator over the authenticated signals channel. Reporting has its own bounded
+exchange and does not turn a successful scrape into a failed scrape. See the
+[feedback wire contract](signals.md#gateway-ingest-feedback).
+
+`grid_signals_feedback_failures_total{reason}` counts each failed delivery
+attempt once. Its bounded reasons are `timeout` for an expired exchange budget,
+`transport` for connection, authentication, or HTTP errors, `status` for a
+non-204 response, and `acknowledgment` for missing, repeated, or mismatched
+acknowledgment metadata. A successful delivery or a cycle with no pending
+report adds no failure. Failed deliveries retain evidence for retry and do not
+fail scrapes; report contents never become metric labels.
+
+A bad observation is retained until its exact report is acknowledged. Later
+clean cycles cannot replace an unacknowledged bad report. New rejection can
+supersede an unacknowledged clean report; a delayed acknowledgment for that old
+clean cannot clear the newer bad evidence. Failed fetches create no clean
+observation, but can retry pending bad evidence. The highest sequence and
+counter values latch rejected evidence instead of wrapping.
+
+The random process epoch, sequence, cumulative count, and pending evidence
+survive committed poller and certificate reloads. A staged or rejected reload
+publishes nothing. The reporter folds a committed observation before refresh
+and cancellation, so replacing a poller during refresh cannot lose a genuine
+skew drop. Feedback is scoped to the verified local operator identity.
+
+The operator exposes `GatewayAgesRejected` independently of peer diagnostics.
+Its [status and recovery rules](crds.md#gateway-age-evidence) preserve unresolved
+replica evidence across silence, replacement, and operator restart. These
+conditions explain discarded signals; they do not alter network phase or add a
+routing failure mode.
