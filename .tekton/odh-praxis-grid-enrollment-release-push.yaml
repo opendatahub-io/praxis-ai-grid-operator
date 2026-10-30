@@ -24,7 +24,7 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/opendatahub/odh-praxis-grid-enrollment:odh-v3.6.0
+    value: quay.io/opendatahub/odh-praxis-grid-enrollment:odh-v3.6.0-rc.3
   - name: dockerfile
     value: deploy/enrollment/Dockerfile.konflux
   - name: path-context
