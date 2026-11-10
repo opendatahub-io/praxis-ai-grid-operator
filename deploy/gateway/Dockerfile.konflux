@@ -19,9 +19,14 @@ COPY . .
 # source replacement. Cargo finds that file from the working directory, not from
 # --manifest-path, so the build has to run from here or the git dependency is unresolvable.
 WORKDIR /src/crates/gateway
+# CARGO_FEATURES selects the Praxis policy profile. The FIPS profiles link the system
+# OpenSSL only; the default profile bundles aws-lc, which check-payload refuses. A
+# pipeline passes build-args CARGO_FEATURES=... to override.
+ARG CARGO_FEATURES=fips,policy-jwt-fips
 # --locked: under prefetch a build free to re-resolve can drift from what was fetched.
 # --ignore-rust-version: UBI ships 1.92, the manifests declare 1.96.
 RUN cargo build --release --locked --ignore-rust-version --bin grid-gateway \
+        --no-default-features --features "${CARGO_FEATURES}" \
     && cp target/release/grid-gateway /usr/local/bin/grid-gateway
 
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:d34666200b64d5a183c867487fd2f48ee8547eb18134e5647099970e26f08af9
